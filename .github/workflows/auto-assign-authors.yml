@@ -1,0 +1,63 @@
+name: Auto-assign PR authors
+
+# Assigns the PR opener plus every human commit author on the PR, so a PR
+# always shows who wrote it. Re-runs on push to pick up commits from new
+# authors; adding an already-assigned user is a no-op.
+on:
+  pull_request:
+    types: [opened, reopened, synchronize]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  assign:
+    # Fork PRs get a read-only token, so assigning would fail anyway.
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: self-hosted
+    permissions:
+      pull-requests: write
+    steps:
+      # self-hosted runners don't ship the gh CLI, so go through the API instead
+      - name: Assign PR and commit authors
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const pr = context.payload.pull_request;
+            const commits = await github.paginate(github.rest.pulls.listCommits, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: pr.number,
+              per_page: 100,
+            });
+
+            // Bots (renovate[bot], dependabot[bot], ...) can't be assignees, and
+            // commits whose email isn't linked to a GitHub account have no author.
+            const users = [pr.user, ...commits.map((c) => c.author)]
+              .filter((u) => u && u.type === 'User');
+            const already = new Set(pr.assignees.map((a) => a.login));
+            const logins = [...new Set(users.map((u) => u.login))]
+              .filter((login) => !already.has(login));
+
+            if (logins.length === 0) {
+              core.info('No new authors to assign.');
+              return;
+            }
+
+            // GitHub caps a PR at 10 assignees.
+            const assignees = logins.slice(0, Math.max(0, 10 - already.size));
+            if (assignees.length === 0) {
+              core.warning(`PR already has 10 assignees, skipping: ${logins.join(', ')}`);
+              return;
+            }
+            core.info(`Assigning: ${assignees.join(', ')}`);
+            await github.rest.issues.addAssignees({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: pr.number,
+              assignees,
+            });
